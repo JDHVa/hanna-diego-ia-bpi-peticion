@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flor de la Mano</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; background:#05030a; overflow:hidden; font-family: system-ui, sans-serif; }
+  #stage { position:fixed; inset:0; }
+  /* cámara a pantalla completa, espejada */
+  #video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover;
+           transform:scaleX(-1); z-index:0; filter:brightness(.55) saturate(.8) contrast(1.05); }
+  #vignette { position:absolute; inset:0; z-index:1; pointer-events:none;
+              background:radial-gradient(ellipse at 50% 50%, transparent 35%, rgba(5,3,10,.85) 100%); }
+  canvas { position:absolute; inset:0; width:100%; height:100%; display:block; z-index:2; }
+  #hud { position:absolute; left:20px; top:18px; z-index:6; color:#e9d7ff; font-size:13px;
+         letter-spacing:.5px; text-shadow:0 0 12px #a855f7aa, 0 1px 3px #000; line-height:1.7; }
+  #hud b { font-weight:600; color:#fff; }
+  .bar { width:180px; height:6px; background:#ffffff22; border-radius:99px; overflow:hidden; margin-top:6px; }
+  .bar i { display:block; height:100%; width:0%; border-radius:99px;
+           background:linear-gradient(90deg,#f472b6,#a855f7,#22d3ee); box-shadow:0 0 14px #a855f7; transition:width .08s linear; }
+  #start { position:absolute; inset:0; z-index:20; display:grid; place-content:center; gap:18px;
+           text-align:center; background:radial-gradient(circle at 50% 45%, #1a0b2e, #05030a 70%); }
+  #start h1 { font-size:34px; font-weight:300; letter-spacing:6px; color:#fff; text-shadow:0 0 30px #a855f7; }
+  #start p { color:#c4b5fd; font-size:14px; max-width:420px; }
+  #start button { justify-self:center; padding:12px 30px; border:0; border-radius:99px; cursor:pointer;
+    font-size:15px; letter-spacing:2px; color:#fff; background:linear-gradient(90deg,#7c3aed,#db2777);
+    box-shadow:0 0 40px #a855f788; transition:transform .2s; }
+  #start button:hover { transform:scale(1.06); }
+  #err { color:#fca5a5; font-size:13px; min-height:18px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <div id="vignette"></div>
+  <canvas id="scene"></canvas>
+  <div id="hud">
+    <div><b>Abre la mano</b> para que florezca</div>
+    <div class="bar"><i id="barFill"></i></div>
+    <div id="status" style="opacity:.7;margin-top:6px">buscando mano…</div>
+  </div>
+</div>
+
+<div id="start">
+  <h1>F L O R</h1>
+  <p>Permite el acceso a la cámara, muestra tu mano y ábrela lentamente.<br>La flor nacerá en tu palma.</p>
+  <button id="go">EMPEZAR</button>
+  <div id="err"></div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const video   = document.getElementById('video');
+const scene   = document.getElementById('scene');
+const ctx     = scene.getContext('2d');
+const barFill = document.getElementById('barFill');
+const statusEl= document.getElementById('status');
+const errEl   = document.getElementById('err');
+
+// capa nítida (la flor "sólida") y capa de luz (lo que va al bloom)
+const solid = document.createElement('canvas'), sctx = solid.getContext('2d');
+const glow  = document.createElement('canvas'), gctx = glow.getContext('2d');
+
+let W = 0, H = 0;
+const DPR = Math.min(devicePixelRatio || 1, 2);
+function resize() {
+  W = innerWidth; H = innerHeight;
+  for (const c of [scene, solid, glow]) { c.width = W * DPR; c.height = H * DPR; }
+  for (const g of [ctx, sctx, gctx]) g.setTransform(DPR,0,0,DPR,0,0);
+}
+addEventListener('resize', resize); resize();
+
+/* ---------------- estado ---------------- */
+let openness = 0;
+let bloomAmt = 0;
+let palm = { x: W/2, y: H/2, s: 1 };
+let t = 0;
+let flash = 0, flashDone = false;   // destello de pantalla al florecer
+
+/* ---------------- geometría de la flor ---------------- */
+// 4 coronas de pétalos: de fuera hacia dentro
+const RINGS = [
+  { n: 12, len: 1.00, wid: 0.42, off: 0.00, hue: 322, sat: 78, lit: 52, open: 0.00 },
+  { n: 10, len: 0.76, wid: 0.40, off: 0.31, hue: 330, sat: 82, lit: 60, open: 0.14 },
+  { n:  8, len: 0.54, wid: 0.38, off: 0.19, hue: 340, sat: 86, lit: 68, open: 0.30 },
+  { n:  6, len: 0.34, wid: 0.36, off: 0.52, hue: 348, sat: 90, lit: 76, open: 0.48 },
+];
+// pequeña variación por pétalo para que no se vea perfecto/robótico
+const jitter = RINGS.map(r => Array.from({length: r.n}, () => ({
+  s: 0.88 + Math.random() * 0.24, a: (Math.random() - 0.5) * 0.10
+})));
+
+const motes = Array.from({length: 70}, () => ({
+  a: Math.random() * Math.PI * 2, r: 0.5 + Math.random() * 1.4,
+  sp: 0.1 + Math.random() * 0.5, sz: 0.6 + Math.random() * 2.0,
+  ph: Math.random() * Math.PI * 2, hue: 300 + Math.random() * 70
+}));
+
+const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
+const smooth  = v => v * v * (3 - 2 * v);
+// remapea k al tramo [a,b] -> 0..1 (para encadenar fases: rama, hojas, flor)
+const phase = (k, a, b) => smooth(clamp01((k - a) / (b - a)));
+
+/* ---------------- rama, hojas y capullo ---------------- */
+const LEAVES = [
+  { at: 0.30, side:  1, sz: 0.85, grow: 0.18 },
+  { at: 0.52, side: -1, sz: 1.00, grow: 0.28 },
+  { at: 0.74, side:  1, sz: 0.75, grow: 0.40 },
+];
+
+// curva de la rama: nace abajo y sube hasta la palma (0,0). u va de 0 (base) a 1 (flor)
+function stemPoint(u, len, sway) {
+  const bend = Math.sin(u * Math.PI) * len * 0.16 * sway;
+  return { x: bend, y: len * (1 - u) };
+}
+
+function drawStem(g, k, scale) {
+  const grown = phase(k, 0.0, 0.34);
+  if (grown <= 0.002) return;
+  const len  = 260 * scale * grown;
+  const sway = Math.sin(t * 0.9) * 0.8 + Math.sin(t * 1.7) * 0.3;
+
+  // tallo: trazo cónico (grueso abajo, fino arriba)
+  const N = 26;
+  for (let i = 0; i < N; i++) {
+    const u0 = i / N, u1 = (i + 1) / N;
+    const p0 = stemPoint(u0, len, sway), p1 = stemPoint(u1, len, sway);
+    g.strokeStyle = `hsl(${104 + u0 * 18}, ${44 + u0 * 16}%, ${16 + u0 * 22}%)`;
+    g.lineWidth = (7 - 5 * u0) * scale;
+    g.lineCap = 'round';
+    g.beginPath(); g.moveTo(p0.x, p0.y); g.lineTo(p1.x, p1.y); g.stroke();
+  }
+  // luz lateral en el tallo
+  g.strokeStyle = 'hsla(120, 70%, 70%, .28)';
+  g.lineWidth = 1.4 * scale;
+  g.beginPath();
+  for (let i = 0; i <= N; i++) { const p = stemPoint(i / N, len, sway); i ? g.lineTo(p.x - 1.5, p.y) : g.moveTo(p.x - 1.5, p.y); }
+  g.stroke();
+
+  // hojas que se despliegan a lo largo de la rama
+  for (const lf of LEAVES) {
+    if (grown < lf.at) continue;
+    const open = phase(k, lf.grow, lf.grow + 0.22);
+    if (open <= 0.002) continue;
+    const p = stemPoint(lf.at, len, sway);
+    const L = 70 * scale * lf.sz * open, Wd = 26 * scale * lf.sz * open;
+    g.save();
+    g.translate(p.x, p.y);
+    g.rotate(lf.side * (1.15 - 0.35 * open) + Math.sin(t * 1.2 + lf.at * 6) * 0.06);
+    const lg = g.createLinearGradient(0, 0, 0, -L);
+    lg.addColorStop(0, '#14401f'); lg.addColorStop(0.5, '#2f7d3a'); lg.addColorStop(1, '#7dd87a');
+    g.fillStyle = lg;
+    g.beginPath();
+    g.moveTo(0, 0);
+    g.bezierCurveTo( Wd, -L * 0.30,  Wd * 0.75, -L * 0.80, 0, -L);
+    g.bezierCurveTo(-Wd * 0.75, -L * 0.80, -Wd, -L * 0.30, 0, 0);
+    g.fill();
+    g.strokeStyle = 'hsla(110, 60%, 80%, .35)'; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, 0); g.lineTo(0, -L * 0.92); g.stroke();
+    g.restore();
+  }
+
+  // sépalos en la base de la flor
+  const sep = phase(k, 0.24, 0.5);
+  if (sep > 0.002) {
+    for (let i = 0; i < 5; i++) {
+      g.save();
+      g.rotate((i / 5) * Math.PI * 2 + 0.3);
+      const L = 34 * scale * sep;
+      g.fillStyle = '#2c6b33';
+      g.beginPath();
+      g.moveTo(0, 0);
+      g.bezierCurveTo(10 * scale, -L * 0.4, 7 * scale, -L * 0.8, 0, -L);
+      g.bezierCurveTo(-7 * scale, -L * 0.8, -10 * scale, -L * 0.4, 0, 0);
+      g.fill();
+      g.restore();
+    }
+  }
+}
+
+// capullo cerrado que precede a la flor y se desvanece cuando abren los pétalos
+function drawBud(g, k, scale) {
+  const b = phase(k, 0.16, 0.42) * (1 - phase(k, 0.42, 0.62));
+  if (b <= 0.002) return;
+  const R = 46 * scale * b;
+  g.save();
+  const bg = g.createLinearGradient(0, R * 0.6, 0, -R);
+  bg.addColorStop(0, '#4a1030'); bg.addColorStop(0.6, '#a11b56'); bg.addColorStop(1, '#f06fae');
+  g.fillStyle = bg;
+  g.beginPath();
+  g.moveTo(0, R * 0.55);
+  g.bezierCurveTo(R * 0.72, R * 0.2, R * 0.55, -R * 0.75, 0, -R);
+  g.bezierCurveTo(-R * 0.55, -R * 0.75, -R * 0.72, R * 0.2, 0, R * 0.55);
+  g.fill();
+  g.strokeStyle = 'hsla(330,90%,85%,.35)'; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(0, R * 0.5); g.lineTo(0, -R * 0.9); g.stroke();
+  g.restore();
+}
+
+// Pétalo: base angosta, cuerpo ancho redondeado, punta con muesca suave (tipo rosa/loto).
+function petalPath(g, L, Wd) {
+  g.beginPath();
+  g.moveTo(0, 0);
+  g.bezierCurveTo( Wd * 0.55, -L * 0.12,  Wd, -L * 0.42,  Wd * 0.72, -L * 0.78);
+  g.bezierCurveTo( Wd * 0.55, -L * 0.96,  Wd * 0.22, -L * 0.93,  0, -L * 0.86); // muesca
+  g.bezierCurveTo(-Wd * 0.22, -L * 0.93, -Wd * 0.55, -L * 0.96, -Wd * 0.72, -L * 0.78);
+  g.bezierCurveTo(-Wd,       -L * 0.42, -Wd * 0.55, -L * 0.12,  0, 0);
+  g.closePath();
+}
+
+function drawPetal(g, L, Wd, ring, curl) {
+  // curl: 0 = abierto plano, 1 = cerrado (pétalo enrollado hacia el centro)
+  g.save();
+  g.scale(1 - 0.55 * curl, 1);            // se angosta al cerrarse
+  const grd = g.createLinearGradient(0, 0, 0, -L);
+  grd.addColorStop(0,    `hsl(${ring.hue - 14}, ${ring.sat}%, ${ring.lit * 0.42}%)`); // base en sombra
+  grd.addColorStop(0.35, `hsl(${ring.hue}, ${ring.sat}%, ${ring.lit * 0.8}%)`);
+  grd.addColorStop(0.78, `hsl(${ring.hue + 6}, ${ring.sat}%, ${ring.lit}%)`);
+  grd.addColorStop(1,    `hsl(${ring.hue + 14}, ${ring.sat - 10}%, ${Math.min(94, ring.lit + 26)}%)`); // punta clara
+  g.fillStyle = grd;
+  petalPath(g, L, Wd);
+  g.fill();
+
+  // borde luminoso
+  g.strokeStyle = `hsla(${ring.hue + 20}, 100%, 88%, .45)`;
+  g.lineWidth = 1;
+  g.stroke();
+
+  // nervadura central
+  g.strokeStyle = `hsla(${ring.hue - 10}, 90%, ${ring.lit * 0.45}%, .5)`;
+  g.lineWidth = Math.max(0.8, Wd * 0.045);
+  g.beginPath(); g.moveTo(0, -L * 0.04); g.lineTo(0, -L * 0.7); g.stroke();
+
+  // brillo especular
+  const sp = g.createRadialGradient(-Wd * 0.25, -L * 0.55, 0, -Wd * 0.25, -L * 0.55, Wd * 0.8);
+  sp.addColorStop(0, 'rgba(255,255,255,.28)');
+  sp.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = sp;
+  petalPath(g, L, Wd);
+  g.fill();
+  g.restore();
+}
+
+function drawFlower(k, scale) {
+  const R = 150 * scale;                   // radio base de la flor
+  const breathe = 1 + 0.02 * Math.sin(t * 1.4);
+
+  /* --- capa SÓLIDA: la flor --- */
+  sctx.save();
+  sctx.translate(palm.x, palm.y);
+  sctx.scale(breathe, breathe);
+
+  // fase 1: la rama crece desde abajo, con hojas y sépalos
+  drawStem(sctx, k, scale);
+  // fase 2: capullo
+  drawBud(sctx, k, scale);
+
+  // fase 3: los pétalos abren (sólo a partir del 38% de apertura)
+  const kf = phase(k, 0.38, 1.0);
+
+  for (let ri = 0; ri < RINGS.length; ri++) {
+    const r = RINGS[ri];
+    const lk = smooth(clamp01((kf - r.open) / (1 - r.open)));
+    if (lk <= 0.002) continue;
+    const grow = 0.18 + 0.82 * lk;         // brotan pequeños y crecen
+    const curl = 1 - lk;
+    const L = R * r.len * grow;
+    const Wd = R * r.wid * grow;
+    const spin = t * (0.05 + ri * 0.02) * (ri % 2 ? -1 : 1);
+
+    // sombra suave bajo la corona para dar profundidad
+    sctx.save();
+    sctx.globalAlpha = 0.35 * lk;
+    sctx.fillStyle = 'rgba(20,0,25,1)';
+    sctx.beginPath(); sctx.ellipse(0, L * 0.06, L * 0.85, L * 0.85, 0, 0, Math.PI * 2); sctx.fill();
+    sctx.restore();
+
+    for (let i = 0; i < r.n; i++) {
+      const j = jitter[ri][i];
+      sctx.save();
+      sctx.rotate((i / r.n) * Math.PI * 2 + r.off + spin + j.a);
+      drawPetal(sctx, L * j.s, Wd * j.s, r, curl);
+      sctx.restore();
+    }
+  }
+
+  // ---- centro: disco + estambres ----
+  const cr = R * 0.13 * (0.35 + 0.65 * kf) * (0.15 + 0.85 * kf);
+  if (cr > 0.5) {
+  const disc = sctx.createRadialGradient(-cr*0.3, -cr*0.3, cr*0.1, 0, 0, cr);
+  disc.addColorStop(0,   '#fff6c9');
+  disc.addColorStop(0.5, '#f7c948');
+  disc.addColorStop(1,   '#b45309');
+  sctx.fillStyle = disc;
+  sctx.beginPath(); sctx.arc(0, 0, cr, 0, Math.PI * 2); sctx.fill();
+
+  for (let i = 0; i < 26; i++) {
+    const a = (i / 26) * Math.PI * 2 + t * 0.25;
+    const rr = cr * (0.55 + 0.42 * ((i * 7919) % 100) / 100);
+    const wob = Math.sin(t * 2.2 + i) * cr * 0.06;
+    sctx.fillStyle = i % 3 ? '#ffe680' : '#fff9d6';
+    sctx.beginPath();
+    sctx.arc(Math.cos(a) * rr + wob, Math.sin(a) * rr, Math.max(1, cr * 0.11), 0, Math.PI * 2);
+    sctx.fill();
+  }
+  }
+  sctx.restore();
+
+  /* --- capa GLOW: aura, anillos, polen (todo en lighter -> alimenta el bloom) --- */
+  gctx.save();
+  gctx.translate(palm.x, palm.y);
+  gctx.globalCompositeOperation = 'lighter';
+
+  // el aura acompaña a los pétalos, no a la rama
+  const ka = kf;
+  const auraR = (70 + 300 * ka) * scale;
+  const pulse = 0.5 + 0.5 * Math.sin(t * 1.6);
+  const aura = gctx.createRadialGradient(0, 0, R * 0.1, 0, 0, auraR);
+  aura.addColorStop(0,    `hsla(320, 100%, 82%, ${0.34 * ka})`);
+  aura.addColorStop(0.25, `hsla(288, 100%, 66%, ${0.20 * ka})`);
+  aura.addColorStop(0.6,  `hsla(195, 100%, 62%, ${0.11 * ka * (0.6 + 0.4 * pulse)})`);
+  aura.addColorStop(1,    'hsla(260, 100%, 50%, 0)');
+  gctx.fillStyle = aura;
+  gctx.beginPath(); gctx.arc(0, 0, auraR, 0, Math.PI * 2); gctx.fill();
+
+  for (let i = 0; i < 3; i++) {
+    const rr = (0.4 + i * 0.26) * auraR * (0.92 + 0.08 * Math.sin(t * 1.2 + i));
+    gctx.strokeStyle = `hsla(${300 - i * 50}, 100%, 78%, ${0.12 * ka})`;
+    gctx.lineWidth = 1.5 + i * 0.6;
+    gctx.beginPath(); gctx.arc(0, 0, rr, 0, Math.PI * 2); gctx.stroke();
+  }
+
+  // chispas verdes subiendo por la rama mientras crece
+  const sg = phase(k, 0.02, 0.4) * (1 - kf * 0.6);
+  if (sg > 0.01) {
+    for (let i = 0; i < 14; i++) {
+      const u = ((t * 0.35 + i / 14) % 1);
+      const p = stemPoint(u, 260 * scale * phase(k, 0, 0.34), Math.sin(t * 0.9) * 0.8);
+      gctx.fillStyle = `hsla(${110 + u * 60}, 100%, 75%, ${0.5 * sg * (1 - u)})`;
+      gctx.beginPath(); gctx.arc(p.x, p.y, 2.2 * scale, 0, Math.PI * 2); gctx.fill();
+    }
+  }
+
+  // halo cálido del centro
+  const ch = gctx.createRadialGradient(0, 0, 0, 0, 0, R * 0.5 * (0.4 + ka));
+  ch.addColorStop(0, `rgba(255,240,190,${0.55 * (0.3 + ka)})`);
+  ch.addColorStop(1, 'rgba(255,180,60,0)');
+  gctx.fillStyle = ch;
+  gctx.beginPath(); gctx.arc(0, 0, R * 0.5 * (0.4 + ka), 0, Math.PI * 2); gctx.fill();
+
+  for (const m of motes) {
+    const rr = m.r * R * (0.35 + 0.9 * ka);
+    const a = m.a + t * m.sp * 0.28;
+    const yy = Math.sin(t * m.sp + m.ph) * 16 * scale;
+    gctx.fillStyle = `hsla(${m.hue}, 100%, 80%, ${0.55 * ka})`;
+    gctx.beginPath();
+    gctx.arc(Math.cos(a) * rr, Math.sin(a) * rr * 0.9 + yy, m.sz * scale, 0, Math.PI * 2);
+    gctx.fill();
+  }
+  gctx.restore();
+}
+
+/* ---------------- render + bloom ---------------- */
+function render() {
+  t += 0.016;
+  bloomAmt += (openness - bloomAmt) * 0.06;
+  const k = clamp01(bloomAmt);
+
+  ctx.clearRect(0, 0, W, H);
+  sctx.clearRect(0, 0, W, H);
+  gctx.clearRect(0, 0, W, H);
+  drawFlower(k, palm.s);
+
+  // 1) aura/polen de fondo, sumada
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.filter = 'none';
+  ctx.drawImage(glow, 0, 0, W, H);
+
+  // 2) bloom del glow (halos grandes)
+  for (const [b, a] of [[20, 0.5], [55, 0.35], [110, 0.25]]) {
+    ctx.filter = `blur(${b}px) saturate(1.5)`;
+    ctx.globalAlpha = a * (0.3 + 0.7 * k);
+    ctx.drawImage(glow, 0, 0, W, H);
+  }
+
+  // 3) bloom de la flor (glow ceñido al contorno de los pétalos)
+  for (const [b, a] of [[8, 0.35], [24, 0.28], [60, 0.18]]) {
+    ctx.filter = `blur(${b}px) saturate(1.6) brightness(1.15)`;
+    ctx.globalAlpha = a * (0.3 + 0.7 * k);
+    ctx.drawImage(solid, 0, 0, W, H);
+  }
+
+  // 4) la flor nítida encima -> se lee la forma
+  ctx.filter = 'none';
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(solid, 0, 0, W, H);
+
+  // 5) un último realce suave para que "brille" sin comerse el dibujo
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.filter = 'blur(14px)';
+  ctx.globalAlpha = 0.22 * (0.3 + 0.7 * k);
+  ctx.drawImage(solid, 0, 0, W, H);
+  ctx.filter = 'none';
+  ctx.globalAlpha = 1;
+
+  /* ---- BLOOM DE PANTALLA COMPLETA ---- */
+  const kf = phase(k, 0.38, 1.0);
+
+  // destello: se dispara al terminar de abrir la flor
+  if (kf > 0.94 && !flashDone) { flash = 1; flashDone = true; }
+  if (kf < 0.6) flashDone = false;
+  flash *= 0.94;
+
+  // 1) la luz de la flor se derrama por toda la pantalla
+  ctx.globalCompositeOperation = 'lighter';
+  const spill = ctx.createRadialGradient(palm.x, palm.y, 0, palm.x, palm.y, Math.hypot(W, H) * 0.75);
+  const bp = 0.5 + 0.5 * Math.sin(t * 1.3);
+  spill.addColorStop(0,    `hsla(320, 100%, 78%, ${0.16 * kf})`);
+  spill.addColorStop(0.35, `hsla(285, 100%, 62%, ${0.09 * kf})`);
+  spill.addColorStop(0.7,  `hsla(200, 100%, 60%, ${0.05 * kf * (0.6 + 0.4 * bp)})`);
+  spill.addColorStop(1,    'hsla(260, 100%, 50%, 0)');
+  ctx.fillStyle = spill;
+  ctx.fillRect(0, 0, W, H);
+
+  // 2) velo uniforme: sube el nivel de negro de toda la escena
+  ctx.fillStyle = `hsla(300, 100%, 70%, ${0.045 * kf * (0.7 + 0.3 * bp)})`;
+  ctx.fillRect(0, 0, W, H);
+
+  // 3) destello blanco + onda expansiva
+  if (flash > 0.01) {
+    ctx.fillStyle = `rgba(255,240,255,${0.55 * flash})`;
+    ctx.fillRect(0, 0, W, H);
+    const wr = (1 - flash) * Math.hypot(W, H) * 0.9;
+    ctx.strokeStyle = `rgba(255,220,255,${0.5 * flash})`;
+    ctx.lineWidth = 30 * flash + 2;
+    ctx.beginPath(); ctx.arc(palm.x, palm.y, wr, 0, Math.PI * 2); ctx.stroke();
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+  // 4) viñeta para que el derrame no aplane los bordes
+  const vg = ctx.createRadialGradient(palm.x, palm.y, Math.min(W,H) * 0.15, palm.x, palm.y, Math.hypot(W,H) * 0.6);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, `rgba(5,3,10,${0.35 * kf})`);
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, W, H);
+
+  barFill.style.width = (k * 100).toFixed(0) + '%';
+  requestAnimationFrame(render);
+}
+
+/* ---------------- MediaPipe ---------------- */
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, (a.z||0) - (b.z||0));
+
+// [pip, tip] de índice, medio, anular y meñique
+const FINGERS = [[6, 8], [10, 12], [14, 16], [18, 20]];
+
+// autocalibración: se adapta a tu mano y a la distancia a la cámara
+let calMin = 0.35, calMax = 0.65;
+
+function computeOpenness(lm) {
+  const wrist = lm[0];
+  const ref = dist(wrist, lm[9]) || 1e-6;
+
+  // Un dedo estirado tiene la punta MUCHO más lejos de la muñeca que su nudillo medio;
+  // doblado, la punta queda incluso más cerca. Ese cociente no depende del tamaño de
+  // la mano ni de si está de lado.
+  let sum = 0;
+  for (const [pip, tip] of FINGERS) {
+    const r = dist(wrist, lm[tip]) / (dist(wrist, lm[pip]) || 1e-6);
+    sum += clamp01((r - 0.85) / 0.62);       // ~0.85 doblado, ~1.47 estirado
+  }
+  // el pulgar se mide por su separación del meñique, no por la muñeca
+  const thumb = clamp01((dist(lm[4], lm[17]) / ref - 0.85) / 0.75);
+
+  const raw = (sum + thumb * 0.8) / 4.8;
+
+  // reajusta el rango con lo que realmente hace tu mano (con deriva lenta de vuelta)
+  if (raw > calMax) calMax = raw; else calMax += (0.62 - calMax) * 0.0006;
+  if (raw < calMin) calMin = raw; else calMin += (0.32 - calMin) * 0.0006;
+  const span = Math.max(0.18, calMax - calMin);
+
+  lastRaw = raw;
+  return clamp01((raw - calMin) / span);
+}
+let lastRaw = 0;
+
+// R = reiniciar calibración (si se descuadra por un gesto raro)
+addEventListener('keydown', e => {
+  if (e.key === 'r' || e.key === 'R') { calMin = 0.35; calMax = 0.65; }
+});
+
+// el video usa object-fit:cover -> hay que mapear coords normalizadas con el mismo recorte
+function videoToScreen(nx, ny) {
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const scale = Math.max(W / vw, H / vh);
+  const dw = vw * scale, dh = vh * scale;
+  const ox = (W - dw) / 2, oy = (H - dh) / 2;
+  return { x: ox + (1 - nx) * dw, y: oy + ny * dh };   // 1-nx por el espejo
+}
+
+async function start() {
+  errEl.textContent = 'iniciando cámara…';
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }, audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+
+  errEl.textContent = 'cargando modelo…';
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  const hand = await HandLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numHands: 1
+  });
+
+  document.getElementById('start').remove();
+  render();
+
+  let last = -1;
+  (function detect() {
+    if (video.currentTime !== last) {
+      last = video.currentTime;
+      const res = hand.detectForVideo(video, performance.now());
+      if (res.landmarks && res.landmarks.length) {
+        const lm = res.landmarks[0];
+        openness = computeOpenness(lm);
+
+        const ids = [0, 5, 9, 13, 17];
+        let cx = 0, cy = 0;
+        for (const i of ids) { cx += lm[i].x; cy += lm[i].y; }
+        const p = videoToScreen(cx / ids.length, cy / ids.length);
+        palm.x += (p.x - palm.x) * 0.15;
+        palm.y += (p.y - palm.y) * 0.15;
+
+        const span = dist(lm[0], lm[9]) * Math.min(W, H);
+        palm.s += (Math.max(0.5, Math.min(2.0, span / 110)) - palm.s) * 0.1;
+
+        statusEl.textContent = `mano detectada · apertura ${(openness*100)|0}% `
+          + `(bruto ${lastRaw.toFixed(2)} · rango ${calMin.toFixed(2)}–${calMax.toFixed(2)} · R para recalibrar)`;
+      } else {
+        openness *= 0.94;
+        statusEl.textContent = 'buscando mano…';
+      }
+    }
+    requestAnimationFrame(detect);
+  })();
+}
+
+document.getElementById('go').addEventListener('click', () => {
+  start().catch(e => { errEl.textContent = 'Error: ' + e.message; console.error(e); });
+});
+</script>
+</body>
+</html>
